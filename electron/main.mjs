@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mkdir } from 'node:fs/promises'
+import { lstat, mkdir, readFile, symlink, unlink } from 'node:fs/promises'
 
 const require = createRequire(import.meta.url)
 const here = dirname(fileURLToPath(import.meta.url))
@@ -23,6 +23,79 @@ function rememberLog(source, chunk) {
   }
   recentLog = recentLog.slice(-30)
   return text
+}
+
+async function pathExists(path) {
+  try {
+    await lstat(path)
+    return true
+  } catch (error) {
+    if (error.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+/**
+ * pnpm link: dependencies do not install a linked plugin's own dependency
+ * tree. Bridge only missing packages that are already bundled with Harness.
+ */
+async function bridgeLinkedPluginDependencies(dshHome, bundledModules) {
+  const profileManifestPath = join(dshHome, 'profiles', 'web', 'package.json')
+  let profileManifest
+  try {
+    profileManifest = JSON.parse(await readFile(profileManifestPath, 'utf8'))
+  } catch (error) {
+    if (error.code === 'ENOENT') return
+    throw error
+  }
+
+  const packageAliases = new Map([
+    ['schemastery', '@deepseek-ai/schemastery']
+  ])
+
+  for (const spec of Object.values(profileManifest.dependencies ?? {})) {
+    if (typeof spec !== 'string' || !spec.startsWith('link:')) continue
+    const pluginRoot = spec.slice('link:'.length)
+    if (!pluginRoot.startsWith('/')) continue
+
+    let pluginManifest
+    try {
+      pluginManifest = JSON.parse(await readFile(join(pluginRoot, 'package.json'), 'utf8'))
+    } catch {
+      continue
+    }
+
+    const requestedPackages = new Set([
+      ...Object.keys(pluginManifest.dependencies ?? {}),
+      ...Object.keys(pluginManifest.peerDependencies ?? {})
+    ])
+
+    for (const packageName of requestedPackages) {
+      const bundledName = packageAliases.get(packageName) ?? packageName
+      const bundledPath = join(bundledModules, ...bundledName.split('/'))
+      if (!await pathExists(bundledPath)) continue
+
+      const pluginPath = join(pluginRoot, 'node_modules', ...packageName.split('/'))
+      try {
+        if (await pathExists(pluginPath)) {
+          // lstat sees broken symlinks; access through the path does not.
+          try {
+            await readFile(join(pluginPath, 'package.json'))
+            continue
+          } catch {
+            const stat = await lstat(pluginPath)
+            if (!stat.isSymbolicLink()) continue
+            await unlink(pluginPath)
+          }
+        }
+        await mkdir(dirname(pluginPath), { recursive: true })
+        await symlink(bundledPath, pluginPath, 'dir')
+        rememberLog('desktop', `Bridged ${packageName} for ${pluginManifest.name ?? pluginRoot}`)
+      } catch (error) {
+        rememberLog('desktop', `Could not bridge ${packageName}: ${error.message}`)
+      }
+    }
+  }
 }
 
 function splashUrl(state = 'starting', detail = '') {
@@ -66,9 +139,11 @@ async function startHarness() {
 
   const dshPackage = require.resolve('@deepseek-ai/dsh/package.json')
   const dshBin = join(dirname(dshPackage), 'lib', 'bin.js')
+  const bundledModules = join(dirname(dshPackage), '..', '..')
   const dshHome = join(app.getPath('userData'), 'harness-home')
   const workspaceRoot = app.getPath('documents')
   await mkdir(dshHome, { recursive: true })
+  await bridgeLinkedPluginDependencies(dshHome, bundledModules)
 
   harnessProcess = spawn(process.execPath, ['--expose-internals', dshBin, 'web', '--port', '0'], {
     cwd: workspaceRoot,

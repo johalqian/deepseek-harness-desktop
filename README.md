@@ -14,6 +14,7 @@ DeepSeek Harness Desktop 是 [DeepSeek Harness](https://github.com/deepseek-ai/d
 - Keeps Harness settings and sessions in the macOS application-data directory.
 - Shuts down the Harness process when the desktop app exits.
 - Shows actionable startup logs and supports one-click restart.
+- Repairs missing dependencies for locally linked Harness plugins when the required package is bundled with the app.
 - Pins `@deepseek-ai/dsh` to a tested version.
 - Verifies packaged Harness peer dependencies during every release build.
 
